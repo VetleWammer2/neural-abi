@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "neuralabi"
+version = "0.1.0"
+description = "A linker and ABI verifier for neural checkpoints."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+authors = [{name = "NeuralABI contributors"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch>=2.6,<3",
+  "safetensors>=0.4.5,<1",
+]
+
+[project.optional-dependencies]
+llama = ["transformers>=4.48,<6"]
+dev = [
+  "build>=1.2",
+  "hypothesis>=6.120",
+  "mypy>=1.14",
+  "psutil>=6,<8",
+  "pytest>=8.3",
+  "pytest-cov>=6",
+  "ruff>=0.9",
+  "transformers>=4.48,<6",
+]
+
+[project.scripts]
+neuralabi = "neuralabi.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/neuralabi"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "integration: end-to-end integration tests",
+  "slow: generated matrices and benchmarks",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["neuralabi"]
+mypy_path = "src"
+warn_unused_ignores = true
+show_error_codes = true
