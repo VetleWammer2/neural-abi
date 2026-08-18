@@ -12,6 +12,25 @@ from neuralabi.status import PlanValidationError
 from neuralabi.transforms import TransformExpr, Transpose, expr_from_dict
 
 
+def _parameter_only_mutation(
+    plan: ConversionPlan, targets: dict[str, PlannedTensor]
+) -> ConversionPlan:
+    """Keep semantic-negative fixtures runnable without stale optimizer bindings.
+
+    A mutation rewrites the expression graph after synthesis. Plan-v2 optimizer identities are
+    derived from that graph, so these parameter-verification fixtures drop to the supported v1
+    parameter-only representation rather than carry a mapping that no longer matches.
+    """
+
+    return replace(
+        plan,
+        schema_version=1,
+        targets=targets,
+        optimizer_mapping=None,
+        plan_hash="",
+    ).with_hash()
+
+
 def mutate_semantic_bindings(
     plan: ConversionPlan,
     source_model: CanonicalModel,
@@ -38,7 +57,7 @@ def mutate_semantic_bindings(
     targets[target_key] = PlannedTensor(
         expression, previous.shape, previous.dtype, previous.semantic_slots
     )
-    return replace(plan, targets=targets, plan_hash="").with_hash()
+    return _parameter_only_mutation(plan, targets)
 
 
 def mutate_square_transpose(plan: ConversionPlan, *, target_key: str) -> ConversionPlan:
@@ -47,7 +66,7 @@ def mutate_square_transpose(plan: ConversionPlan, *, target_key: str) -> Convers
         raise PlanValidationError("transpose mutation requires a square rank-two target")
     targets = dict(plan.targets)
     targets[target_key] = replace(previous, expression=Transpose(previous.expression, (0, 1)))
-    return replace(plan, targets=targets, plan_hash="").with_hash()
+    return _parameter_only_mutation(plan, targets)
 
 
 def mutate_interleave_groups(
@@ -77,4 +96,4 @@ def mutate_interleave_groups(
     expression.infer_spec(plan.source_tensors)
     targets = dict(plan.targets)
     targets[target_key] = replace(previous, expression=expression)
-    return replace(plan, targets=targets, plan_hash="").with_hash()
+    return _parameter_only_mutation(plan, targets)

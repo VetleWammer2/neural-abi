@@ -5,4 +5,4 @@ from neuralabi.status import ClaimStatus, LinkStatus
 
 __all__ = ["ClaimStatus", "LinkStatus", "ModelAdapter", "__version__"]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

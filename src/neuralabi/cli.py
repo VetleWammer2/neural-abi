@@ -35,6 +35,7 @@ from neuralabi.status import (
 from neuralabi.synth.solver import synthesize_plan
 from neuralabi.util.canonical_json import pretty_dumps
 from neuralabi.util.hashing import hash_file
+from neuralabi.util.paths import ensure_disjoint_paths
 from neuralabi.verify.certificate import verify_conversion
 
 
@@ -137,6 +138,16 @@ def _seeds(value: str) -> tuple[int, ...]:
     return result
 
 
+def _resume_steps(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("resume steps must be an integer") from exc
+    if result < 0 or result > 128:
+        raise argparse.ArgumentTypeError("resume steps must be between zero and 128")
+    return result
+
+
 def _check_plan_endpoints(plan: ConversionPlan, pair: AnalyzedPair) -> None:
     checks = {
         "source graph": (plan.source.graph_hash, pair.source_capture.artifact.graph_hash),
@@ -235,9 +246,14 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         args.output,
         max_shard_size=parse_size(args.max_shard_size),
         manifest_path=args.manifest,
+        source_optimizer_state=args.source_optimizer_state,
+        optimizer_output=args.optimizer_output,
     )
     print(f"Target checkpoint fingerprint: {result.checkpoint_fingerprint}")
     print(f"Generated: {result.checkpoint_path}")
+    if result.optimizer_state is not None:
+        print(f"Target optimizer bundle hash: {result.optimizer_state.bundle_hash}")
+        print(f"Generated: {result.optimizer_state.checkpoint_path}")
     return 0
 
 
@@ -249,6 +265,9 @@ def _verify(
     *,
     seeds: Sequence[int],
     file_hashes: dict[str, str] | None = None,
+    source_optimizer_state: Path | None = None,
+    target_optimizer_state: Path | None = None,
+    resume_steps: int = 0,
 ) -> Any:
     _check_plan_endpoints(plan, pair)
     source_store = open_tensor_store(source_checkpoint)
@@ -277,18 +296,40 @@ def _verify(
         source_checkpoint_fingerprint=source_store.fingerprint(),
         target_checkpoint_fingerprint=target_store.fingerprint(),
         generated_file_hashes=file_hashes,
+        source_optimizer_state=source_optimizer_state,
+        target_optimizer_state=target_optimizer_state,
+        resume_steps=resume_steps,
     )
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
+    protected_inputs = (
+        args.plan,
+        args.source_checkpoint,
+        args.target_checkpoint,
+        args.source_optimizer_state,
+        args.target_optimizer_state,
+    )
+    for path in protected_inputs:
+        if path is not None:
+            ensure_disjoint_paths(path, args.output)
     pair = _pair_from_args(args)
     plan = load_plan(args.plan)
+    optimizer_supplied = (
+        args.source_optimizer_state is not None or args.target_optimizer_state is not None
+    )
+    resume_steps = (
+        (1 if optimizer_supplied else 0) if args.resume_steps is None else args.resume_steps
+    )
     certificate = _verify(
         plan,
         pair,
         args.source_checkpoint,
         args.target_checkpoint,
         seeds=args.seeds,
+        source_optimizer_state=args.source_optimizer_state,
+        target_optimizer_state=args.target_optimizer_state,
+        resume_steps=resume_steps,
     )
     certificate.write(args.output)
     print(f"Verification: {certificate.verification_outcome.value}")
@@ -317,6 +358,9 @@ def _cmd_explain(args: argparse.Namespace) -> int:
         "assumptions": list(plan.assumptions),
         "ambiguity": list(plan.ambiguity),
         "inverse_available": plan.inverse_targets is not None,
+        "optimizer_mapping": None
+        if plan.optimizer_mapping is None
+        else plan.optimizer_mapping.to_dict(),
     }
     if args.json:
         print(pretty_dumps(explanation), end="")
@@ -333,6 +377,14 @@ def _cmd_explain(args: argparse.Namespace) -> int:
         print(
             f"Exact inverse: {'available' if plan.inverse_targets is not None else 'not available'}"
         )
+        if plan.optimizer_mapping is None:
+            print("Optimizer mapping: unavailable (parameter-only plan)")
+        else:
+            print(
+                "Optimizer mapping: "
+                f"{len(plan.optimizer_mapping.source_parameter_identities)} source -> "
+                f"{len(plan.optimizer_mapping.target_parameter_identities)} target identities"
+            )
     return 0
 
 
@@ -347,6 +399,11 @@ def _cmd_emit(args: argparse.Namespace) -> int:
 
 def _report(plan: ConversionPlan, certificate: Any, result: ConversionResult) -> str:
     claims = "\n".join(f"- {claim.claim}: {claim.status.value}" for claim in certificate.claims)
+    optimizer = (
+        "not requested"
+        if result.optimizer_state is None
+        else f"`{result.optimizer_state.bundle_hash}`"
+    )
     return f"""# NeuralABI link report
 
 - Mapping status: {plan.mapping_status.value}
@@ -354,6 +411,7 @@ def _report(plan: ConversionPlan, certificate: Any, result: ConversionResult) ->
 - Source adapter: `{plan.source.adapter_id}`
 - Target adapter: `{plan.target.adapter_id}`
 - Target checkpoint fingerprint: `{result.checkpoint_fingerprint}`
+- Target optimizer bundle: {optimizer}
 - Verification outcome: {certificate.verification_outcome.value}
 
 ## Claims
@@ -368,6 +426,9 @@ proof for every possible input.
 
 def _cmd_link(args: argparse.Namespace) -> int:
     output: Path = args.output
+    ensure_disjoint_paths(args.source_checkpoint, output)
+    if args.source_optimizer_state is not None:
+        ensure_disjoint_paths(args.source_optimizer_state, output)
     if output.exists() and (output.is_file() or any(output.iterdir())):
         raise NeuralABIError(f"link output must be absent or empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
@@ -379,12 +440,17 @@ def _cmd_link(args: argparse.Namespace) -> int:
     plan.write(plan_path)
     target_path = output / "target"
     manifest_path = output / "conversion-manifest.json"
+    target_optimizer_path = (
+        output / "target-optimizer" if args.source_optimizer_state is not None else None
+    )
     conversion = apply_checkpoint(
         plan,
         args.source_checkpoint,
         target_path,
         max_shard_size=parse_size(args.max_shard_size),
         manifest_path=manifest_path,
+        source_optimizer_state=args.source_optimizer_state,
+        optimizer_output=target_optimizer_path,
     )
     converter_path = output / "converter.py"
     emit_converter(plan, converter_path)
@@ -393,6 +459,18 @@ def _cmd_link(args: argparse.Namespace) -> int:
         for path in (analysis_path, plan_path, manifest_path, converter_path)
     }
     generated_hashes.update(conversion.file_hashes)
+    if conversion.optimizer_state is not None:
+        generated_hashes.update(
+            {
+                f"target-optimizer/{key}": value
+                for key, value in conversion.optimizer_state.file_hashes.items()
+            }
+        )
+    resume_steps = (
+        (2 if args.source_optimizer_state is not None else 0)
+        if args.resume_steps is None
+        else args.resume_steps
+    )
     certificate = _verify(
         plan,
         pair,
@@ -400,6 +478,9 @@ def _cmd_link(args: argparse.Namespace) -> int:
         conversion.checkpoint_path,
         seeds=args.seeds,
         file_hashes=generated_hashes,
+        source_optimizer_state=args.source_optimizer_state,
+        target_optimizer_state=target_optimizer_path,
+        resume_steps=resume_steps,
     )
     certificate_path = output / "certificate.json"
     certificate.write(certificate_path)
@@ -439,6 +520,8 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--output", required=True, type=Path)
     apply.add_argument("--manifest", type=Path)
     apply.add_argument("--max-shard-size", default="2GB")
+    apply.add_argument("--source-optimizer-state", type=Path)
+    apply.add_argument("--optimizer-output", type=Path)
     apply.set_defaults(handler=_cmd_apply)
 
     verify = subparsers.add_parser("verify", help="verify a converted checkpoint")
@@ -446,6 +529,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_pair_arguments(verify)
     verify.add_argument("--source-checkpoint", required=True, type=Path)
     verify.add_argument("--target-checkpoint", required=True, type=Path)
+    verify.add_argument("--source-optimizer-state", type=Path)
+    verify.add_argument("--target-optimizer-state", type=Path)
+    verify.add_argument("--resume-steps", type=_resume_steps)
     verify.add_argument("--seeds", type=_seeds, default=(0, 1, 2, 3))
     verify.add_argument("--output", type=Path, default=Path("certificate.json"))
     verify.set_defaults(handler=_cmd_verify)
@@ -457,6 +543,8 @@ def build_parser() -> argparse.ArgumentParser:
     link.add_argument("--max-candidates", type=int, default=128)
     link.add_argument("--max-shard-size", default="2GB")
     link.add_argument("--seeds", type=_seeds, default=(0, 1, 2, 3))
+    link.add_argument("--source-optimizer-state", type=Path)
+    link.add_argument("--resume-steps", type=_resume_steps)
     link.set_defaults(handler=_cmd_link)
 
     explain = subparsers.add_parser("explain", help="explain a conversion plan")
