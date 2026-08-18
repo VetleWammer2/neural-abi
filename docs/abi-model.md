@@ -21,3 +21,9 @@ state aliases, and the supporting exported nodes.
 The linker composes each source physical decoder with the inverse target physical view. Every
 persistent target key must occur in the plan's embedded target schema, as a generated expression or
 an explicit alias. Source state must be consumed or accounted for through a physical alias.
+
+Optimizer state binds to unique parameter identities, not to checkpoint-key spelling and not to
+PyTorch optimizer integer IDs. A tied identity may expose several model-state keys and still own one
+Adam state record. For each target identity the plan reuses its parameter expression for both
+moments. Scalar steps and group membership follow the fusion and splitting rules in the
+[optimizer-state format](optimizer-state-format.md).

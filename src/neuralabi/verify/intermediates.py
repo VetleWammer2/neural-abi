@@ -28,7 +28,7 @@ def record_graph_values(
 ) -> dict[str, Any]:
     if kwargs:
         # Exported GraphModule flattens keyword arguments into its positional signature. The
-        # adapter contract remains general, but v0.1 anchor capture requires positional probes.
+        # adapter contract remains general, but anchor capture currently requires positional probes.
         raise UnsupportedGraphError("semantic anchor capture does not support keyword-only probes")
     interpreter = _RecordingInterpreter(module)
     interpreter.run(*args)

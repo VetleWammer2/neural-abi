@@ -58,4 +58,13 @@ def test_opaque_twin_mlp_end_to_end(tmp_path: Path) -> None:
     assert claims["INTERMEDIATE_VERIFIED"] == ClaimStatus.VERIFIED
     assert claims["PARAMETER_GRADIENT_VERIFIED"] == ClaimStatus.VERIFIED
     assert claims["ROUNDTRIP_EXACT"] == ClaimStatus.VERIFIED
+    assert claims["PARAMETER_STATE_CONVERTED"] == ClaimStatus.VERIFIED
+    assert claims["OPTIMIZER_STATE_CONVERTED"] == ClaimStatus.NOT_APPLICABLE
+    assert claims["OPTIMIZER_COVERAGE_COMPLETE"] == ClaimStatus.NOT_APPLICABLE
+    assert claims["OPTIMIZER_STATE_VERIFIED"] == ClaimStatus.NOT_APPLICABLE
+    assert claims["RESUMED_TRAINING_EQUIVALENT"] == ClaimStatus.NOT_APPLICABLE
+    assert certificate.conversion_scope == {
+        "parameter_state": True,
+        "optimizer_state": False,
+    }
     assert all(item["exact"] for item in certificate.roundtrip_results)

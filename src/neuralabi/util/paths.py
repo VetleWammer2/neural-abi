@@ -17,6 +17,21 @@ def ensure_distinct_paths(source: Path, output: Path) -> None:
         raise NeuralABIError("output path must not be inside the input checkpoint directory")
 
 
+def ensure_disjoint_paths(first: Path, second: Path) -> None:
+    """Reject equal paths and either direction of path nesting."""
+
+    first_resolved = first.resolve(strict=False)
+    second_resolved = second.resolve(strict=False)
+    if (
+        first_resolved == second_resolved
+        or first_resolved.is_relative_to(second_resolved)
+        or second_resolved.is_relative_to(first_resolved)
+    ):
+        raise NeuralABIError(
+            f"paths must be distinct and non-nested: {first_resolved} and {second_resolved}"
+        )
+
+
 def atomic_replace(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     os.replace(source, destination)

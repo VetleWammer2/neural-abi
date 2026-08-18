@@ -94,4 +94,4 @@ def open_tensor_store(path: Path) -> TensorStore:
         if len(singles) == 1:
             return SingleSafeTensorStore(singles[0])
         raise CheckpointError(f"expected one SafeTensors file or index in {path}")
-    raise CheckpointError(f"unsupported checkpoint path {path}; v0.1 accepts SafeTensors only")
+    raise CheckpointError(f"unsupported checkpoint path {path}; NeuralABI accepts SafeTensors only")

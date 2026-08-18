@@ -8,13 +8,22 @@ from neuralabi import __version__
 from neuralabi.export.artifact import ExportArtifact
 from neuralabi.export.signature import compare_signatures
 from neuralabi.formats.plan import (
+    OPTIMIZER_FUSION_STEP_POLICY,
+    OPTIMIZER_MAPPING_SEMANTICS,
+    OPTIMIZER_PARAMETER_GROUP_POLICY,
+    OPTIMIZER_SCALAR_FIELDS,
+    OPTIMIZER_TENSOR_FIELDS,
     PLAN_SCHEMA_VERSION,
     AliasRecord,
     ConversionPlan,
+    OptimizerMapping,
+    ParameterIdentityRecord,
     PlanEndpoint,
     PlannedTensor,
+    TargetParameterIdentityRecord,
 )
 from neuralabi.ir.semantic import CanonicalModel, PhysicalView
+from neuralabi.ir.state import parameter_identity_groups
 from neuralabi.status import LinkStatus, PlanValidationError
 from neuralabi.transforms import Alias, TensorSpec
 from neuralabi.util.hashing import hash_canonical
@@ -48,6 +57,64 @@ def _alias_peers(model: CanonicalModel) -> dict[str, tuple[str, ...]]:
         for key in keys:
             result[key] = peers
     return result
+
+
+def _optimizer_mapping(
+    source: CanonicalModel,
+    target: CanonicalModel,
+    targets: dict[str, PlannedTensor],
+    aliases: tuple[AliasRecord, ...],
+) -> OptimizerMapping:
+    source_groups = parameter_identity_groups(source.state_schema)
+    target_groups = parameter_identity_groups(target.state_schema)
+    source_records = tuple(
+        ParameterIdentityRecord(f"source.parameter[{index:06d}]", keys)
+        for index, keys in enumerate(source_groups)
+    )
+    source_identity_for_key = {
+        key: record.identity for record in source_records for key in record.model_keys
+    }
+    alias_keys = {record.key for record in aliases}
+    target_records: list[TargetParameterIdentityRecord] = []
+    for index, keys in enumerate(target_groups):
+        primary = [key for key in keys if key not in alias_keys]
+        if len(primary) != 1:
+            raise PlanValidationError(
+                f"target parameter identity {keys!r} does not have exactly one primary binding"
+            )
+        expression_target = primary[0]
+        planned = targets[expression_target]
+        try:
+            source_identities = tuple(
+                sorted({source_identity_for_key[key] for key in planned.expression.source_keys()})
+            )
+        except KeyError as exc:
+            raise PlanValidationError(
+                f"target parameter {expression_target!r} depends on non-parameter state"
+            ) from exc
+        semantic_slots = tuple(
+            sorted({slot for key in keys for slot in targets[key].semantic_slots})
+        )
+        target_records.append(
+            TargetParameterIdentityRecord(
+                f"target.parameter[{index:06d}]",
+                keys,
+                expression_target,
+                source_identities,
+                semantic_slots,
+            )
+        )
+    return OptimizerMapping(
+        semantics=OPTIMIZER_MAPPING_SEMANTICS,
+        tensor_fields=OPTIMIZER_TENSOR_FIELDS,
+        scalar_fields=OPTIMIZER_SCALAR_FIELDS,
+        fusion_step_policy=OPTIMIZER_FUSION_STEP_POLICY,
+        parameter_group_policy=OPTIMIZER_PARAMETER_GROUP_POLICY,
+        source_parameter_keys=tuple(sorted(source_identity_for_key)),
+        target_parameter_keys=tuple(sorted(key for keys in target_groups for key in keys)),
+        source_parameter_identities=source_records,
+        target_parameter_identities=tuple(target_records),
+    )
 
 
 def _compose_targets(
@@ -117,6 +184,7 @@ def synthesize_plan(
     compare_signatures(source.architecture, target.architecture)
     targets, aliases = _compose_targets(source, target)
     inverse_targets, _ = _compose_targets(target, source)
+    optimizer_mapping = _optimizer_mapping(source, target, targets, aliases)
     source_specs = _state_specs(source)
     target_specs = _state_specs(target)
     for key, planned in targets.items():
@@ -173,6 +241,7 @@ def synthesize_plan(
         ambiguity=(),
         inverse_targets=inverse_targets,
         plan_hash="",
+        optimizer_mapping=optimizer_mapping,
     ).with_hash()
     candidate_hash = hash_canonical(
         {key: target_tensor.expression.to_dict() for key, target_tensor in sorted(targets.items())}

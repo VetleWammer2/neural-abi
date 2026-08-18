@@ -16,6 +16,6 @@ class ModelAdapter(Protocol):
 
 Load adapters with `module:attribute`. An attribute may be an adapter instance or class. `prepare`
 should disable caches and stochastic behavior. Both adapters' probes must describe equivalent
-inputs. v0.1 semantic-intermediate capture currently requires positional probe arguments.
+inputs. v0.2 semantic-intermediate capture currently requires positional probe arguments.
 
 Model adapters execute arbitrary user-provided Python code. Only run adapters you trust.
