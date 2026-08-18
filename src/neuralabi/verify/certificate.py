@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -16,10 +17,12 @@ from neuralabi.formats.certificate import (
 )
 from neuralabi.formats.plan import ConversionPlan, validate_plan
 from neuralabi.ir.semantic import CanonicalModel
-from neuralabi.status import ClaimStatus
+from neuralabi.status import ClaimStatus, PlanValidationError
 from neuralabi.verify.forward import compare_pytrees
 from neuralabi.verify.gradients import verify_input_gradients, verify_parameter_gradients
 from neuralabi.verify.intermediates import compare_anchors, record_graph_values
+from neuralabi.verify.optimizer import verify_optimizer_state
+from neuralabi.verify.resume import verify_resumed_training
 from neuralabi.verify.roundtrip import verify_roundtrip
 
 
@@ -46,8 +49,18 @@ def verify_conversion(
     source_checkpoint_fingerprint: str,
     target_checkpoint_fingerprint: str,
     generated_file_hashes: dict[str, str] | None = None,
+    source_optimizer_state: Path | None = None,
+    target_optimizer_state: Path | None = None,
+    resume_steps: int = 0,
+    resume_seed_base: int = 30_000,
 ) -> VerificationCertificate:
     validate_plan(plan)
+    if (source_optimizer_state is None) != (target_optimizer_state is None):
+        raise PlanValidationError("source and target optimizer states must be supplied together")
+    if resume_steps < 0 or resume_steps > 128:
+        raise PlanValidationError("resume_steps must be between zero and 128")
+    if resume_steps and source_optimizer_state is None:
+        raise PlanValidationError("resumed training requires source and target optimizer states")
     target_values = (
         apply_to_state(plan, source_state) if target_state is None else _clone_state(target_state)
     )
@@ -163,7 +176,93 @@ def verify_conversion(
     all_roundtrip = all(item.exact for item in roundtrip)
     if not all_roundtrip and first_divergence is None:
         first_divergence = next(item.key for item in roundtrip if not item.exact)
+
+    optimizer_supplied = source_optimizer_state is not None
+    optimizer_coverage: dict[str, Any] = {
+        "complete": False,
+        "reason": "no optimizer state supplied",
+    }
+    optimizer_associations: tuple[dict[str, Any], ...] = ()
+    optimizer_state_results: tuple[dict[str, Any], ...] = ()
+    optimizer_converted_status = ClaimStatus.NOT_APPLICABLE
+    optimizer_coverage_status = ClaimStatus.NOT_APPLICABLE
+    optimizer_verification_status = ClaimStatus.NOT_APPLICABLE
+    optimizer_detail = "no optimizer state supplied"
+    optimizer_pass = True
+    if source_optimizer_state is not None and target_optimizer_state is not None:
+        optimizer = verify_optimizer_state(
+            plan,
+            source_optimizer_state,
+            target_optimizer_state,
+            target_checkpoint_fingerprint=target_checkpoint_fingerprint,
+        )
+        optimizer_coverage = optimizer.coverage_dict()
+        optimizer_associations = optimizer.associations
+        optimizer_state_results = tuple(item.to_dict() for item in optimizer.comparisons)
+        optimizer_converted_status = ClaimStatus.VERIFIED
+        optimizer_coverage_status = (
+            ClaimStatus.VERIFIED if optimizer.coverage_complete else ClaimStatus.FAILED
+        )
+        optimizer_verification_status = (
+            ClaimStatus.VERIFIED if optimizer.passed else ClaimStatus.FAILED
+        )
+        optimizer_detail = (
+            f"{optimizer.algorithm} state for "
+            f"{optimizer.target_parameter_count} unique target parameters"
+        )
+        optimizer_pass = optimizer.passed
+        if not optimizer.passed and first_divergence is None:
+            first_divergence = next(
+                item.comparison.path for item in optimizer.comparisons if not item.passed
+            )
+
+    resume_results: tuple[dict[str, Any], ...] = ()
+    resume_status = ClaimStatus.NOT_APPLICABLE
+    resume_detail = "no optimizer state supplied"
+    resume_pass = True
+    resume_contract: dict[str, Any] = {}
+    if optimizer_supplied and resume_steps == 0:
+        resume_detail = "no resumed optimizer steps requested"
+    elif (
+        source_optimizer_state is not None
+        and target_optimizer_state is not None
+        and resume_steps > 0
+    ):
+        resumed = verify_resumed_training(
+            plan,
+            source_capture,
+            target_capture,
+            source_state,
+            target_values,
+            source_optimizer_state,
+            target_optimizer_state,
+            steps=resume_steps,
+            seed_base=resume_seed_base,
+        )
+        resumed_data = resumed.to_dict()
+        resume_results = tuple(item.to_dict() for item in resumed.steps)
+        resume_contract = resumed_data["numerical_contract"]
+        resume_status = ClaimStatus.VERIFIED if resumed.passed else ClaimStatus.FAILED
+        resume_detail = f"{resume_steps} synchronized seeded {resumed.optimizer_algorithm} steps"
+        resume_pass = resumed.passed
+        if not resumed.passed and first_divergence is None:
+            for step in resumed.steps:
+                candidates = (step.loss, *step.outputs, *step.model_state)
+                failed = next((item for item in candidates if not item.passed), None)
+                if failed is not None:
+                    first_divergence = failed.comparison.path
+                    break
     claims = (
+        VerificationClaim(
+            "PARAMETER_STATE_CONVERTED",
+            ClaimStatus.VERIFIED,
+            f"{len(plan.targets)} physical target tensors generated",
+        ),
+        VerificationClaim(
+            "PARAMETER_STATE_COVERAGE_COMPLETE",
+            ClaimStatus.VERIFIED,
+            f"{len(plan.targets)} target tensors covered",
+        ),
         VerificationClaim(
             "STATE_COVERAGE_COMPLETE",
             ClaimStatus.VERIFIED,
@@ -206,8 +305,37 @@ def verify_conversion(
             else ClaimStatus.NOT_APPLICABLE,
             "reported only when observed",
         ),
+        VerificationClaim(
+            "OPTIMIZER_STATE_CONVERTED",
+            optimizer_converted_status,
+            optimizer_detail,
+        ),
+        VerificationClaim(
+            "OPTIMIZER_COVERAGE_COMPLETE",
+            optimizer_coverage_status,
+            optimizer_detail,
+        ),
+        VerificationClaim(
+            "OPTIMIZER_STATE_VERIFIED",
+            optimizer_verification_status,
+            "bitwise step/exp_avg/exp_avg_sq comparison"
+            if optimizer_supplied
+            else optimizer_detail,
+        ),
+        VerificationClaim(
+            "RESUMED_TRAINING_EQUIVALENT",
+            resume_status,
+            resume_detail,
+        ),
     )
-    required_pass = all_forward and all_intermediate and all_gradients and all_roundtrip
+    required_pass = (
+        all_forward
+        and all_intermediate
+        and all_gradients
+        and all_roundtrip
+        and optimizer_pass
+        and resume_pass
+    )
     if input_gradient_status == ClaimStatus.FAILED:
         required_pass = False
     outcome = ClaimStatus.VERIFIED if required_pass else ClaimStatus.FAILED
@@ -255,4 +383,24 @@ def verify_conversion(
         outcome,
         generated_file_hashes or {},
         certificate_timestamp(),
+        conversion_scope={
+            "parameter_state": True,
+            "optimizer_state": optimizer_supplied,
+        },
+        parameter_coverage={
+            "complete": True,
+            "target_tensor_count": len(plan.targets),
+            "covered": sorted(plan.targets),
+        },
+        optimizer_coverage=optimizer_coverage,
+        optimizer_associations=optimizer_associations,
+        optimizer_state_results=optimizer_state_results,
+        resume_results=resume_results,
+        numeric_contract={
+            "optimizer_tensor_conversion": {
+                "applies": optimizer_supplied,
+                "equality": "bitwise" if optimizer_supplied else None,
+            },
+            "resumed_training": resume_contract,
+        },
     )

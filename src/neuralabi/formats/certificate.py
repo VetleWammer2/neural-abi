@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -53,10 +53,19 @@ class VerificationCertificate:
     verification_outcome: ClaimStatus
     generated_file_hashes: dict[str, str]
     timestamp: str
+    conversion_scope: dict[str, bool] = field(
+        default_factory=lambda: {"parameter_state": True, "optimizer_state": False}
+    )
+    parameter_coverage: dict[str, Any] = field(default_factory=dict)
+    optimizer_coverage: dict[str, Any] = field(default_factory=dict)
+    optimizer_associations: tuple[dict[str, Any], ...] = ()
+    optimizer_state_results: tuple[dict[str, Any], ...] = ()
+    resume_results: tuple[dict[str, Any], ...] = ()
+    numeric_contract: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "neuralabi_version": __version__,
             "pytorch_version": torch.__version__,
             "source_adapter_id": self.source_adapter_id,
@@ -73,20 +82,27 @@ class VerificationCertificate:
             "rewrite_rules_used": list(self.rewrite_rules_used),
             "assumptions": list(self.assumptions),
             "unsupported_regions": list(self.unsupported_regions),
+            "conversion_scope": self.conversion_scope,
             "state_coverage": self.state_coverage,
+            "parameter_coverage": self.parameter_coverage or self.state_coverage,
+            "optimizer_coverage": self.optimizer_coverage,
+            "optimizer_associations": list(self.optimizer_associations),
             "probe_seeds": list(self.probe_seeds),
             "input_signatures": self.input_signatures,
             "numeric_tolerances": self.numeric_tolerances,
+            "numeric_contract": self.numeric_contract,
             "forward_results": list(self.forward_results),
             "intermediate_results": list(self.intermediate_results),
             "gradient_results": list(self.gradient_results),
             "roundtrip_results": list(self.roundtrip_results),
+            "optimizer_state_results": list(self.optimizer_state_results),
+            "resume_results": list(self.resume_results),
             "first_divergence": self.first_divergence,
             "claims": [claim.to_dict() for claim in self.claims],
             "verification_outcome": self.verification_outcome.value,
             "timestamp": self.timestamp,
             "generated_file_hashes": dict(sorted(self.generated_file_hashes.items())),
-            "statement": "Structural compatibility under NeuralABI's documented canonicalization rules, plus empirical verification over the recorded probe suite.",
+            "statement": "Structural compatibility under NeuralABI's documented canonicalization rules, exact coordinate-state verification where optimizer state is included, plus empirical verification over the recorded probe suite.",
         }
 
     def write(self, path: Path) -> None:

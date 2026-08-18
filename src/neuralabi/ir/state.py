@@ -39,6 +39,30 @@ class StateSchema:
         return {"tensors": to_data(self.tensors), "schema_hash": self.schema_hash}
 
 
+def parameter_identity_groups(schema: StateSchema) -> tuple[tuple[str, ...], ...]:
+    """Return deterministic physical parameter identities.
+
+    ``StateSchema`` records aliases by storage identity.  Optimizers attach state to
+    parameter *objects*, so every trainable parameter binding in one alias group must
+    be represented by one optimizer identity rather than by one state entry per key.
+    Singleton parameters form singleton identities.  Frozen parameters and buffer
+    bindings are deliberately excluded.
+    """
+
+    groups: dict[tuple[str, str], list[str]] = {}
+    for tensor in schema.tensors:
+        if tensor.kind != "parameter" or not tensor.requires_grad:
+            continue
+        identity = (
+            ("alias", tensor.alias_group)
+            if tensor.alias_group is not None
+            else ("parameter", tensor.key)
+        )
+        groups.setdefault(identity, []).append(tensor.key)
+    identities = [tuple(sorted(keys)) for keys in groups.values()]
+    return tuple(sorted(identities))
+
+
 def dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 

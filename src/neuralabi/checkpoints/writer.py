@@ -42,7 +42,7 @@ def _write_shard(path: Path, tensors: dict[str, torch.Tensor]) -> int:
     ordered = {key: tensors[key].detach().cpu().contiguous().clone() for key in sorted(tensors)}
     # SafeTensors stores metadata in a hash map whose multi-key iteration order is not stable.
     # A single fixed entry keeps byte output deterministic across repeated conversions.
-    save_file(ordered, path, metadata={"neuralabi": "0.1"})
+    save_file(ordered, path, metadata={"neuralabi": "0.2"})
     return sum(_tensor_bytes(tensor) for tensor in ordered.values())
 
 

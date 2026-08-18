@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -34,10 +35,110 @@ from safetensors.torch import save_file
 
 PLAN = json.loads(__PLAN_JSON_LITERAL__)
 MAX_INDEX_BYTES = 32 * 1024 * 1024
+MAX_JSON_DEPTH = 96
+MAX_OPTIMIZER_PARAMETERS = 1_000_000
+MAX_OPTIMIZER_GROUPS = 65_536
+MAX_MODEL_KEYS = 64
+MAX_STRING = 4096
+OPTIMIZER_MANIFEST = "optimizer.neuralabi.json"
+OPTIMIZER_TENSORS = "state"
 
 
 class ConversionError(Exception):
     pass
+
+
+def canonical_hash(value):
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def validate_json_depth(value, depth=0):
+    if depth > MAX_JSON_DEPTH:
+        raise ConversionError(f"JSON nesting exceeds {MAX_JSON_DEPTH}")
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise ConversionError("JSON object keys must be strings")
+            validate_json_depth(child, depth + 1)
+    elif isinstance(value, list):
+        for child in value:
+            validate_json_depth(child, depth + 1)
+
+
+def load_json_file(path):
+    path = Path(path)
+    if path.stat().st_size > MAX_INDEX_BYTES:
+        raise ConversionError(f"JSON file exceeds the {MAX_INDEX_BYTES}-byte limit")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ConversionError(f"duplicate JSON object key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ConversionError(f"invalid JSON file {path.name!r}: {exc}") from exc
+    validate_json_depth(value)
+    return value
+
+
+def require_object(value, label):
+    if not isinstance(value, dict):
+        raise ConversionError(f"{label} must be an object")
+    return value
+
+
+def require_fields(value, expected, label):
+    data = require_object(value, label)
+    if set(data) != set(expected):
+        raise ConversionError(
+            f"{label} fields differ from schema: "
+            f"missing={sorted(set(expected) - set(data))}, "
+            f"unknown={sorted(set(data) - set(expected))}"
+        )
+    return data
+
+
+def require_string(value, label):
+    if not isinstance(value, str) or not value or len(value) > MAX_STRING or "\0" in value:
+        raise ConversionError(f"{label} must be a non-empty bounded string")
+    return value
+
+
+def require_number(value, label, nonnegative=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConversionError(f"{label} must be a numeric scalar")
+    result = float(value)
+    if not math.isfinite(result) or (nonnegative and result < 0):
+        raise ConversionError(f"{label} must be finite and non-negative")
+    return result
+
+
+def require_bool(value, label, false_only=False):
+    if not isinstance(value, bool):
+        raise ConversionError(f"{label} must be a boolean")
+    if false_only and value:
+        raise ConversionError(f"{label}=true is unsupported")
+    return value
+
+
+def require_false_or_none(value, label):
+    if value is not None and not isinstance(value, bool):
+        raise ConversionError(f"{label} must be false or null")
+    if value is True:
+        raise ConversionError(f"{label}=true is unsupported")
+    return value
 
 
 def dtype_name(tensor):
@@ -62,12 +163,7 @@ class Store:
             else:
                 raise ConversionError("checkpoint directory must contain one SafeTensors file or index")
         if path.name.endswith(".safetensors.index.json"):
-            if path.stat().st_size > MAX_INDEX_BYTES:
-                raise ConversionError("checkpoint index exceeds the size limit")
-            try:
-                index = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                raise ConversionError(f"invalid checkpoint index: {exc}") from exc
+            index = load_json_file(path)
             if not isinstance(index, dict) or set(index) - {"metadata", "weight_map"}:
                 raise ConversionError("checkpoint index has unknown fields")
             weight_map = index.get("weight_map")
@@ -87,7 +183,7 @@ class Store:
             with safe_open(path, framework="pt", device="cpu") as handle:
                 self.files = {key: path for key in handle.keys()}
         else:
-            raise ConversionError("v0.1 accepts only SafeTensors checkpoints")
+            raise ConversionError("NeuralABI accepts only SafeTensors checkpoints")
         self._keys = tuple(sorted(self.files))
         for filename in sorted(set(self.files.values())):
             with safe_open(filename, framework="pt", device="cpu") as handle:
@@ -118,6 +214,29 @@ def fingerprint(store):
             digest.update(value)
         digest.update(tensor.view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
+
+
+def optimizer_fingerprint(store):
+    digest = hashlib.sha256(b"neuralabi-logical-optimizer-state-v1\0")
+    for key in store.keys():
+        raw = store.read(key)
+        tensor = raw.detach().cpu().contiguous().reshape(-1)
+        key_bytes = key.encode("utf-8")
+        shape_text = ",".join(str(x) for x in raw.shape).encode("ascii")
+        dtype_text = dtype_name(raw).encode("ascii")
+        for value in (key_bytes, shape_text, dtype_text):
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def bitwise_equal(first, second):
+    if first.shape != second.shape or first.dtype != second.dtype:
+        return False
+    first_bytes = first.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+    second_bytes = second.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+    return torch.equal(first_bytes, second_bytes)
 
 
 def axis(value, rank, insertion=False):
@@ -187,6 +306,198 @@ def dependencies(expr):
     return set()
 
 
+def validate_shape(shape, label):
+    if not isinstance(shape, list) or len(shape) > 16:
+        raise ConversionError(f"{label} must be a bounded integer array")
+    numel = 1
+    for size in shape:
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0 or size > 2**40:
+            raise ConversionError(f"{label} contains an invalid dimension")
+        numel *= size
+        if numel > 2**63 - 1:
+            raise ConversionError(f"{label} has too many elements")
+    return tuple(shape)
+
+
+def validate_hyperparameters(value, label):
+    fields = {
+        "lr", "betas", "eps", "weight_decay", "maximize", "amsgrad",
+        "foreach", "capturable", "differentiable", "fused",
+    }
+    data = require_fields(value, fields, label)
+    betas = data["betas"]
+    if not isinstance(betas, list) or len(betas) != 2:
+        raise ConversionError(f"{label}.betas must contain two numeric scalars")
+    beta_values = [
+        require_number(value, f"{label}.betas[{index}]", True)
+        for index, value in enumerate(betas)
+    ]
+    if any(value >= 1 for value in beta_values):
+        raise ConversionError(f"{label}.betas must be less than one")
+    require_number(data["lr"], f"{label}.lr", True)
+    eps = require_number(data["eps"], f"{label}.eps", True)
+    if eps == 0:
+        raise ConversionError(f"{label}.eps must be positive")
+    require_number(data["weight_decay"], f"{label}.weight_decay", True)
+    require_bool(data["maximize"], f"{label}.maximize")
+    require_bool(data["amsgrad"], f"{label}.amsgrad", True)
+    require_false_or_none(data["foreach"], f"{label}.foreach")
+    require_bool(data["capturable"], f"{label}.capturable", True)
+    require_bool(data["differentiable"], f"{label}.differentiable", True)
+    require_false_or_none(data["fused"], f"{label}.fused")
+    return data
+
+
+def load_optimizer_bundle(path):
+    root = Path(path).resolve(strict=True)
+    if not root.is_dir():
+        raise ConversionError(
+            "optimizer state must be a NeuralABI JSON+SafeTensors bundle; pickle is unsupported"
+        )
+    entries = {item.name for item in root.iterdir()}
+    expected_entries = {OPTIMIZER_MANIFEST, OPTIMIZER_TENSORS}
+    if entries != expected_entries:
+        raise ConversionError(
+            "optimizer bundle entries differ from schema: "
+            f"missing={sorted(expected_entries - entries)}, "
+            f"unknown={sorted(entries - expected_entries)}"
+        )
+    manifest_path = root / OPTIMIZER_MANIFEST
+    state_path = root / OPTIMIZER_TENSORS
+    if not manifest_path.is_file() or not state_path.is_dir():
+        raise ConversionError("optimizer bundle manifest/state paths have the wrong type")
+    manifest_fields = {
+        "schema_version", "format", "algorithm", "model_binding", "parameter_groups",
+        "parameters", "tensor_fingerprint", "bundle_hash",
+    }
+    data = require_fields(load_json_file(manifest_path), manifest_fields, "optimizer manifest")
+    if isinstance(data["schema_version"], bool) or data["schema_version"] != 1:
+        raise ConversionError(f"unsupported optimizer schema version {data['schema_version']!r}")
+    if data["format"] != "neuralabi.optimizer-state":
+        raise ConversionError(f"unsupported optimizer format {data['format']!r}")
+    if not isinstance(data["algorithm"], str) or data["algorithm"] not in {"adam", "adamw"}:
+        raise ConversionError(f"unsupported optimizer algorithm {data['algorithm']!r}")
+    model_binding = require_fields(
+        data["model_binding"], {"state_schema_hash", "checkpoint_fingerprint"}, "model_binding"
+    )
+    require_string(model_binding["state_schema_hash"], "model_binding.state_schema_hash")
+    require_string(
+        model_binding["checkpoint_fingerprint"], "model_binding.checkpoint_fingerprint"
+    )
+    provided_hash = require_string(data["bundle_hash"], "bundle_hash")
+    hash_payload = dict(data)
+    hash_payload.pop("bundle_hash")
+    if canonical_hash(hash_payload) != provided_hash:
+        raise ConversionError("optimizer bundle hash does not match canonical manifest content")
+    require_string(data["tensor_fingerprint"], "tensor_fingerprint")
+
+    groups = data["parameter_groups"]
+    if not isinstance(groups, list) or not groups or len(groups) > MAX_OPTIMIZER_GROUPS:
+        raise ConversionError("parameter_groups must be a non-empty bounded array")
+    grouped_ids = []
+    for index, value in enumerate(groups):
+        label = f"parameter_groups[{index}]"
+        group = require_fields(value, {"parameters", "hyperparameters"}, label)
+        parameters = group["parameters"]
+        if not isinstance(parameters, list) or len(parameters) > MAX_OPTIMIZER_PARAMETERS:
+            raise ConversionError(f"{label}.parameters must be a bounded array")
+        for parameter_id in parameters:
+            require_string(parameter_id, f"{label}.parameters")
+        if len(set(parameters)) != len(parameters):
+            raise ConversionError(f"{label} contains duplicate parameters")
+        grouped_ids.extend(parameters)
+        validate_hyperparameters(group["hyperparameters"], f"{label}.hyperparameters")
+    if len(set(grouped_ids)) != len(grouped_ids):
+        raise ConversionError("an optimizer parameter appears in more than one parameter group")
+
+    parameters = data["parameters"]
+    if (
+        not isinstance(parameters, list)
+        or not parameters
+        or len(parameters) > MAX_OPTIMIZER_PARAMETERS
+    ):
+        raise ConversionError("parameters must be a non-empty bounded array")
+    by_id = {}
+    model_key_owner = {}
+    tensor_keys = []
+    for index, value in enumerate(parameters):
+        label = f"parameters[{index}]"
+        item = require_fields(
+            value,
+            {"parameter_id", "model_keys", "shape", "dtype", "requires_grad", "state"},
+            label,
+        )
+        parameter_id = require_string(item["parameter_id"], f"{label}.parameter_id")
+        if parameter_id in by_id:
+            raise ConversionError("optimizer bundle contains duplicate parameter IDs")
+        by_id[parameter_id] = item
+        model_keys = item["model_keys"]
+        if (
+            not isinstance(model_keys, list)
+            or not model_keys
+            or len(model_keys) > MAX_MODEL_KEYS
+        ):
+            raise ConversionError(f"{label}.model_keys must be a bounded array")
+        for key in model_keys:
+            require_string(key, f"{label}.model_keys")
+        if model_keys != sorted(set(model_keys)):
+            raise ConversionError(f"{label}.model_keys must be sorted and unique")
+        for key in model_keys:
+            if key in model_key_owner:
+                raise ConversionError(f"model key {key!r} belongs to two parameters")
+            model_key_owner[key] = parameter_id
+        validate_shape(item["shape"], f"{label}.shape")
+        dtype = require_string(item["dtype"], f"{label}.dtype")
+        if len(dtype) > 32:
+            raise ConversionError(f"{label}.dtype is too long")
+        if item["requires_grad"] is not True:
+            raise ConversionError("optimizer bundles may contain only trainable parameters")
+        state = require_fields(item["state"], {"step", "exp_avg", "exp_avg_sq"}, f"{label}.state")
+        for field in ("step", "exp_avg", "exp_avg_sq"):
+            tensor_keys.append(require_string(state[field], f"{label}.state.{field}"))
+    if set(grouped_ids) != set(by_id):
+        raise ConversionError(
+            "optimizer parameter coverage is incomplete: "
+            f"missing={sorted(set(by_id) - set(grouped_ids))}, "
+            f"unknown={sorted(set(grouped_ids) - set(by_id))}"
+        )
+    if list(by_id) != sorted(by_id):
+        raise ConversionError("optimizer parameter IDs must be sorted")
+    if len(set(tensor_keys)) != len(tensor_keys):
+        raise ConversionError("optimizer tensor references must be unique")
+
+    store = Store(state_path)
+    if set(store.keys()) != set(tensor_keys):
+        raise ConversionError(
+            "optimizer tensor coverage is incomplete: "
+            f"missing={sorted(set(tensor_keys) - set(store.keys()))}, "
+            f"unknown={sorted(set(store.keys()) - set(tensor_keys))}"
+        )
+    if optimizer_fingerprint(store) != data["tensor_fingerprint"]:
+        raise ConversionError("optimizer tensor fingerprint does not match the manifest")
+    for item in parameters:
+        state = item["state"]
+        expected = (tuple(item["shape"]), item["dtype"])
+        for field in ("exp_avg", "exp_avg_sq"):
+            if metadata(store.read(state[field])) != expected:
+                raise ConversionError(
+                    f"{item['parameter_id']}.{field} metadata does not match its parameter"
+                )
+        step = store.read(state["step"])
+        if metadata(step)[0] != () or metadata(step)[1] not in {"float32", "float64"}:
+            raise ConversionError(f"{item['parameter_id']}.step must be a float scalar")
+        step_value = float(step.item())
+        if (
+            not math.isfinite(step_value)
+            or step_value < 0
+            or step_value != math.floor(step_value)
+        ):
+            raise ConversionError(
+                f"{item['parameter_id']}.step must be finite, non-negative, and integer-valued"
+            )
+    return data, store
+
+
 def parse_size(text):
     text = text.strip().upper().replace("IB", "B")
     for suffix, multiplier in (("GB", 1024**3), ("MB", 1024**2), ("KB", 1024), ("B", 1)):
@@ -214,6 +525,247 @@ def shard_groups(max_bytes):
     if current:
         groups.append(current)
     return groups
+
+
+def write_tensor_directory(values, output, max_bytes):
+    output = Path(output)
+    output.mkdir()
+    groups = []
+    current = []
+    used = 0
+    for key in sorted(values):
+        tensor = values[key]
+        item_bytes = tensor.numel() * tensor.element_size()
+        if current and used + item_bytes > max_bytes:
+            groups.append(current)
+            current, used = [], 0
+        current.append(key)
+        used += item_bytes
+    if current:
+        groups.append(current)
+    if not groups:
+        raise ConversionError("cannot write empty optimizer tensor state")
+    weight_map = {}
+    for index, keys in enumerate(groups, 1):
+        filename = (
+            "model.safetensors"
+            if len(groups) == 1
+            else f"model-{index:05d}-of-{len(groups):05d}.safetensors"
+        )
+        tensors = {
+            key: values[key].detach().cpu().contiguous().clone()
+            for key in keys
+        }
+        save_file(tensors, output / filename, metadata={"neuralabi": "0.2"})
+        weight_map.update({key: filename for key in keys})
+    if len(groups) > 1:
+        total_size = sum(tensor.numel() * tensor.element_size() for tensor in values.values())
+        index = {
+            "metadata": {"total_size": total_size},
+            "weight_map": dict(sorted(weight_map.items())),
+        }
+        (output / "model.safetensors.index.json").write_text(
+            json.dumps(index, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
+
+
+def required_optimizer_mapping():
+    if PLAN.get("schema_version") != 2:
+        raise ConversionError("optimizer conversion requires a schema-version-2 plan")
+    mapping = require_fields(
+        PLAN.get("optimizer_mapping"),
+        {
+            "semantics", "tensor_fields", "scalar_fields", "fusion_step_policy",
+            "parameter_group_policy", "source_parameter_keys", "target_parameter_keys",
+            "source_parameter_identities", "target_parameter_identities",
+        },
+        "optimizer_mapping",
+    )
+    if (
+        mapping["semantics"] != "coordinate-reindex-v1"
+        or mapping["tensor_fields"] != ["exp_avg", "exp_avg_sq"]
+        or mapping["scalar_fields"] != ["step"]
+        or mapping["fusion_step_policy"] != "require_equal"
+        or mapping["parameter_group_policy"] != "require_same_group"
+        or PLAN.get("inverse_targets") is None
+    ):
+        raise ConversionError("optimizer mapping has unsupported semantics or policies")
+    return mapping
+
+
+def convert_optimizer(source_path, output, target_checkpoint_fingerprint, max_shard_size):
+    mapping = required_optimizer_mapping()
+    source_root = Path(source_path).resolve(strict=True)
+    output = Path(output).resolve(strict=False)
+    if output == source_root:
+        raise ConversionError("optimizer output must not overwrite its input")
+    if output.exists() and (output.is_file() or any(output.iterdir())):
+        raise ConversionError(f"refusing to replace non-empty optimizer output {output}")
+    bundle, store = load_optimizer_bundle(source_root)
+    binding = bundle["model_binding"]
+    if binding["state_schema_hash"] != PLAN["source"]["state_schema_hash"]:
+        raise ConversionError("optimizer state does not match the plan source state schema")
+    if binding["checkpoint_fingerprint"] != PLAN["source"].get("checkpoint_fingerprint"):
+        raise ConversionError("optimizer state does not match the plan source checkpoint")
+
+    source_identity_records = mapping["source_parameter_identities"]
+    target_identity_records = mapping["target_parameter_identities"]
+    for record in source_identity_records:
+        require_fields(record, {"id", "model_keys"}, "source optimizer identity")
+    for record in target_identity_records:
+        require_fields(
+            record,
+            {"id", "model_keys", "expression_target", "source_identities", "semantic_slots"},
+            "target optimizer identity",
+        )
+    expected_identities = {
+        record["id"]: tuple(record["model_keys"])
+        for record in source_identity_records
+    }
+    actual_identities = {
+        item["parameter_id"]: tuple(item["model_keys"])
+        for item in bundle["parameters"]
+    }
+    if actual_identities != expected_identities:
+        raise ConversionError("optimizer parameter identities do not match the plan source")
+    for item in bundle["parameters"]:
+        specs = {
+            (tuple(PLAN["source_tensors"][key]["shape"]), PLAN["source_tensors"][key]["dtype"])
+            for key in item["model_keys"]
+        }
+        if specs != {(tuple(item["shape"]), item["dtype"])}:
+            raise ConversionError(
+                f"optimizer parameter {item['parameter_id']!r} metadata disagrees with the plan"
+            )
+
+    source_by_id = {item["parameter_id"]: item for item in bundle["parameters"]}
+    source_id_by_key = {
+        key: record["id"]
+        for record in source_identity_records
+        for key in record["model_keys"]
+    }
+    source_group = {}
+    for group_index, group in enumerate(bundle["parameter_groups"]):
+        for parameter_id in group["parameters"]:
+            source_group[parameter_id] = group_index
+    state_cache = {}
+
+    def state(parameter_id):
+        if parameter_id not in state_cache:
+            item = source_by_id[parameter_id]
+            refs = item["state"]
+            state_cache[parameter_id] = {
+                "step": store.read(refs["step"]),
+                "exp_avg": store.read(refs["exp_avg"]),
+                "exp_avg_sq": store.read(refs["exp_avg_sq"]),
+            }
+        return state_cache[parameter_id]
+
+    tensors = {}
+    parameters = []
+    target_group = {}
+    for index, target in enumerate(target_identity_records):
+        target_id = target["id"]
+        dependency_ids = tuple(target["source_identities"])
+        if not dependency_ids or any(item not in source_by_id for item in dependency_ids):
+            raise ConversionError(f"target optimizer parameter {target_id!r} has unknown dependencies")
+        dependency_groups = {source_group[item] for item in dependency_ids}
+        if len(dependency_groups) != 1:
+            raise ConversionError(f"cannot fuse {target_id!r} across optimizer parameter groups")
+        target_group[target_id] = next(iter(dependency_groups))
+        steps = tuple(state(item)["step"] for item in dependency_ids)
+        first_step = steps[0]
+        if any(
+            value.dtype != first_step.dtype
+            or tuple(value.shape) != tuple(first_step.shape)
+            or not bitwise_equal(value, first_step)
+            for value in steps[1:]
+        ):
+            raise ConversionError(f"cannot fuse {target_id!r} with unequal Adam steps")
+        expression_target = target["expression_target"]
+        if expression_target not in PLAN["targets"]:
+            raise ConversionError(f"optimizer mapping references missing target {expression_target!r}")
+        expression = PLAN["targets"][expression_target]["expression"]
+        expression_keys = dependencies(expression)
+        try:
+            expression_ids = {source_id_by_key[key] for key in expression_keys}
+        except KeyError as exc:
+            raise ConversionError("optimizer expression references non-parameter source state") from exc
+        if expression_ids != set(dependency_ids):
+            raise ConversionError(f"optimizer dependencies for {target_id!r} disagree with expression")
+        target_spec = PLAN["target_tensors"][expression_target]
+        stem = f"state.{index:06d}"
+        refs = {
+            "step": f"{stem}.step",
+            "exp_avg": f"{stem}.exp_avg",
+            "exp_avg_sq": f"{stem}.exp_avg_sq",
+        }
+        tensors[refs["step"]] = first_step.detach().cpu().clone()
+        for field in ("exp_avg", "exp_avg_sq"):
+            sources = {
+                key: state(source_id_by_key[key])[field]
+                for key in expression_keys
+            }
+            tensor = evaluate(expression, sources).detach().cpu().contiguous().clone()
+            expected_metadata = (tuple(target_spec["shape"]), target_spec["dtype"])
+            if metadata(tensor) != expected_metadata:
+                raise ConversionError(f"generated {target_id}.{field} has wrong metadata")
+            tensors[refs[field]] = tensor
+        parameters.append(
+            {
+                "parameter_id": target_id,
+                "model_keys": list(target["model_keys"]),
+                "shape": list(target_spec["shape"]),
+                "dtype": target_spec["dtype"],
+                "requires_grad": True,
+                "state": refs,
+            }
+        )
+    groups = []
+    for group_index, source_group_record in enumerate(bundle["parameter_groups"]):
+        groups.append(
+            {
+                "parameters": [
+                    item["parameter_id"]
+                    for item in parameters
+                    if target_group[item["parameter_id"]] == group_index
+                ],
+                "hyperparameters": source_group_record["hyperparameters"],
+            }
+        )
+    target_bundle = {
+        "schema_version": 1,
+        "format": "neuralabi.optimizer-state",
+        "algorithm": bundle["algorithm"],
+        "model_binding": {
+            "state_schema_hash": PLAN["target"]["state_schema_hash"],
+            "checkpoint_fingerprint": target_checkpoint_fingerprint,
+        },
+        "parameter_groups": groups,
+        "parameters": parameters,
+        "tensor_fingerprint": "pending",
+    }
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}.optimizer-", dir=output.parent))
+    try:
+        state_output = temporary / OPTIMIZER_TENSORS
+        write_tensor_directory(tensors, state_output, max_shard_size)
+        target_bundle["tensor_fingerprint"] = optimizer_fingerprint(Store(state_output))
+        target_bundle["bundle_hash"] = canonical_hash(target_bundle)
+        (temporary / OPTIMIZER_MANIFEST).write_text(
+            json.dumps(target_bundle, ensure_ascii=False, allow_nan=False, sort_keys=True, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+        load_optimizer_bundle(temporary)
+        if output.exists():
+            output.rmdir()
+        os.replace(temporary, output)
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return target_bundle["tensor_fingerprint"], target_bundle["bundle_hash"]
 
 
 def convert(source_path, output, max_shard_size):
@@ -254,7 +806,7 @@ def convert(source_path, output, max_shard_size):
                     raise ConversionError(f"generated target tensor {key!r} has wrong metadata")
                 values[key] = tensor
             filename = "model.safetensors" if len(groups) == 1 else f"model-{index:05d}-of-{len(groups):05d}.safetensors"
-            save_file(dict(sorted(values.items())), bundle / filename, metadata={"neuralabi": "0.1"})
+            save_file(dict(sorted(values.items())), bundle / filename, metadata={"neuralabi": "0.2"})
             weight_map.update({key: filename for key in keys})
         if len(groups) > 1:
             total_size = 0
@@ -276,16 +828,47 @@ def convert(source_path, output, max_shard_size):
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
+    return fingerprint(Store(output))
 
 
 def main():
     parser = argparse.ArgumentParser(description="Standalone NeuralABI checkpoint converter")
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--source-optimizer", type=Path)
+    parser.add_argument("--optimizer-output", type=Path)
     parser.add_argument("--max-shard-size", default="2GB")
     args = parser.parse_args()
     try:
-        convert(args.source, args.output, parse_size(args.max_shard_size))
+        if (args.source_optimizer is None) != (args.optimizer_output is None):
+            raise ConversionError(
+                "--source-optimizer and --optimizer-output must be supplied together"
+            )
+        max_shard_size = parse_size(args.max_shard_size)
+        if args.source_optimizer is not None:
+            required_optimizer_mapping()
+            paths = (
+                args.source.resolve(strict=True),
+                args.output.resolve(strict=False),
+                args.source_optimizer.resolve(strict=True),
+                args.optimizer_output.resolve(strict=False),
+            )
+            if any(
+                first == second or first in second.parents or second in first.parents
+                for index, first in enumerate(paths)
+                for second in paths[index + 1 :]
+            ):
+                raise ConversionError(
+                    "model and optimizer input/output paths must be distinct and non-nested"
+                )
+        target_fingerprint = convert(args.source, args.output, max_shard_size)
+        if args.source_optimizer is not None:
+            convert_optimizer(
+                args.source_optimizer,
+                args.optimizer_output,
+                target_fingerprint,
+                max_shard_size,
+            )
     except (ConversionError, OSError, RuntimeError, ValueError) as exc:
         parser.exit(2, f"converter: error: {exc}\n")
     print(f"Converted with plan __PLAN_HASH__ to {args.output}")

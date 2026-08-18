@@ -60,7 +60,7 @@ identical, and every alias key remains explicit in the plan.
 
 ## Export and canonical graph
 
-Strict `torch.export` is the only complete frontend in v0.1. Capture builds and prepares the model,
+Strict `torch.export` is the only complete frontend in v0.2. Capture builds and prepares the model,
 creates deterministic inputs, exports, runs an empty decomposition table to functionalize local
 mutation without destroying high-level ATen patterns, and rejects graph-signature mutation of
 parameters, buffers, or user inputs.
@@ -134,6 +134,35 @@ deinterleave. To compare target physical gradients with source gradients, Neural
 adjoint of the stored inverse plan. Tied parameters are deduplicated so accumulated logical
 gradients are not counted twice.
 
+## Optimizer state as an ABI
+
+Plan schema v2 records every unique trainable source and target parameter identity, with all exact
+`state_dict` aliases. A target identity references one of the plan's existing parameter expressions
+and the source identities on which it depends. This makes optimizer association structural and
+explicit; PyTorch optimizer integer IDs and parameter-name similarity do not participate.
+
+For the current transform grammar, let $P$ be the global physical coordinate reindexing. Adam's
+first and diagonal second moments convert as
+
+$$m_t=P(m_s), \qquad v_t=P(v_s).$$
+
+The same forward expression is evaluated twice with source leaves rebound to the matching moment.
+This is not an application of the gradient adjoint and is not a generic rule for arbitrary linear
+transforms: it is valid because reshape, permutation, singleton, split/concat, and interleave
+operations move coordinates without scaling or mixing them. Plan validation constrains optimizer
+targets to this grammar and requires exact inverse coverage.
+
+One source parameter may split into several targets, which copy its scalar step and group. Several
+source parameters may fuse only if their steps are bitwise equal and they belong to one source
+parameter group; otherwise stock Adam cannot represent their continuation in one target parameter.
+Tied aliases own one state record. Coverage is measured over these unique identities.
+
+The safe optimizer format is a strict bounded JSON manifest plus a single or sharded SafeTensors
+store. It binds algorithm, groups, identity aliases, tensor metadata, logical tensor fingerprint,
+model schema, and exact model-checkpoint fingerprint. A trusted bridge exports or restores live
+`torch.optim.Adam`/`AdamW` objects by Python parameter identity. Untrusted `.pt`/`.pth` and pickle
+are never loaded.
+
 ## Checkpoints and generated converters
 
 The logical checkpoint fingerprint streams sorted key, shape, dtype, and raw contiguous bytes, so
@@ -145,6 +174,12 @@ Application schedules one target at a time, reading only its source dependencies
 at most one bounded output shard, writes deterministic key order and index JSON to a sibling
 temporary directory, and atomically installs the completed output. One fixed SafeTensors metadata
 entry avoids unordered metadata bytes. Inputs cannot be selected as outputs.
+
+Optimizer application follows the same target expression order for `exp_avg` and `exp_avg_sq`,
+validates complete state and scalar-step/group rules, and emits a separately atomic safe bundle.
+Unlike streamed model conversion, optimizer format v1 materializes the complete source and
+converted moment state before writing bounded output shards. The generated converter embeds the
+same strict optimizer interpreter without importing NeuralABI or model code.
 
 Code generation embeds the same plan and a compact interpreter. It needs only Python, PyTorch, and
 SafeTensors; it does not load adapters, model implementations, NeuralABI, pickle, or arbitrary code.
@@ -164,6 +199,15 @@ Parameter gradients use a deterministic scalar probe and the inverse-plan adjoin
 run only when both adapters supply aligned differentiable inputs; integer token IDs are not
 differentiated. Bijective state plans require bitwise source recovery. Bitwise forward equivalence
 is a separate observed claim, not a success prerequisite.
+
+Optimizer verification recomputes every target moment through the plan and requires bitwise tensor
+and step equality. Resumed-training verification is deliberately separate: it reloads the converted
+model and optimizer states and executes synchronized seeded updates in evaluation mode. Its loss is
+a seeded linear probe over adapter-selected output tensors and is compared before each update;
+outputs and target physical state are compared after each update, with state checked against a
+freshly converted updated source state.
+Float32 uses `atol=1e-7, rtol=1e-5`; float64 uses `atol=1e-12, rtol=1e-10`. Certificates record
+observed errors and exactness but do not claim bitwise-identical continued training.
 
 A certificate is therefore not formal equivalence for unrestricted networks. It states structural
 compatibility under these documented recognition and rewrite rules plus empirical verification on
